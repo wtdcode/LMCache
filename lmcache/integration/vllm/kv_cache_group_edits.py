@@ -91,11 +91,36 @@ def _declares_slot_compression(spec: KVCacheSpec) -> bool:
 
 def _tokens_per_state(spec: KVCacheSpec) -> int:
     """vLLM unified KV cache slot packing (``num_states = block_size //
-    tokens_per_state``); the base property raises for specs without it."""
+    tokens_per_state``); the base property raises for specs without it.
+
+    Values below 1 (``MambaSpec`` uses ``-1``; Whisper block pooling uses a
+    ``Fraction``) mean one state per token here.
+    """
     try:
-        return int(getattr(spec, "tokens_per_state", 1))
+        value = getattr(spec, "tokens_per_state", 1)
     except NotImplementedError:
         return 1
+    return int(value) if value >= 1 else 1
+
+
+def _is_heads_first_layout(kv_layout: str) -> bool:
+    """Whether the per-layer view is ``[B, H, N, C]`` (HND) in memory.
+
+    vLLM's blocks-first layouts (``BLHNC`` / ``BLNHC``) keep the same
+    within-block axis order as ``HND`` / ``NHD`` and only inflate the block
+    stride, which the transfer kernels honour through ``block_stride_elems``.
+
+    Raises:
+        ValueError: For hints outside the vocabulary LMCache can transfer.
+    """
+    if kv_layout in ("HND", "BLHNC"):
+        return True
+    if kv_layout in ("NHD", "BLNHC"):
+        return False
+    raise ValueError(
+        f"Unsupported kv_layout: {kv_layout}. Only NHD, HND, BLHNC and BLNHC "
+        "are supported."
+    )
 
 
 def _leaf_specs(spec: KVCacheSpec) -> list[KVCacheSpec]:
@@ -391,6 +416,41 @@ class _SubpagedAttentionViewEdit(KVCacheGroupEdit):
 ######################
 
 
+class _UnifiedAttentionViewEdit(KVCacheGroupEdit):
+    """Permute a unified attention view into its physical axis order.
+
+    vLLM's unified KV cache (RFC #42082) hands every layer a *logical*
+    ``[B, H, N, C]`` view whose strides encode the physical layout. LMCache
+    infers the format from the stride-sorted shape, which is ambiguous when
+    ``H == 1`` or ``N == 1`` (equal strides): a ``[NB, 1, BS, CS]`` NHD
+    pool would be read as ``bs=1, nh=BS``, collapsing a block into one slot.
+    Re-viewing along the resolved layout makes the shape unambiguous:
+    NHD -> ``[B, N, H, C]``, HND -> ``[B, H, N, C]``.
+    """
+
+    name = "unified-attention-view"
+
+    def matches(self, spec: KVCacheSpec, kv_cache: RegisteredKVCache) -> bool:
+        return (
+            get_kv_cache_spec_kind(spec) != KVCacheSpecKind.MAMBA
+            and "AttentionSpec" in {cls.__name__ for cls in type(spec).__mro__}
+            and isinstance(kv_cache, torch.Tensor)
+            and kv_cache.ndim == 4
+            and getattr(spec, "num_heads", None) == kv_cache.shape[1]
+        )
+
+    def apply(
+        self,
+        spec: KVCacheSpec,
+        kv_cache: RegisteredKVCache,
+        layout_hints: LayoutHints,
+    ) -> torch.Tensor:
+        assert isinstance(kv_cache, torch.Tensor)
+        if _is_heads_first_layout(layout_hints.get("kv_layout", "none")):
+            return kv_cache
+        return kv_cache.permute(0, 2, 1, 3)
+
+
 class _MambaUnifiedViewEdit(KVCacheGroupEdit):
     """Re-view mamba's unified state as a per-token paged tensor.
 
@@ -435,11 +495,7 @@ class _MambaUnifiedViewEdit(KVCacheGroupEdit):
         assert isinstance(kv_cache, torch.Tensor), (
             "single-layer KV cache must be a torch.Tensor"
         )
-        kv_layout = layout_hints.get("kv_layout", "none")
-        if kv_layout not in ("NHD", "HND"):
-            raise ValueError(
-                f"Unsupported kv_layout: {kv_layout}. Only NHD and HND are supported."
-            )
+        heads_first = _is_heads_first_layout(layout_hints.get("kv_layout", "none"))
         num_blocks = kv_cache.shape[0]
         row = kv_cache[0].numel()
         block_size = spec.block_size
@@ -465,12 +521,12 @@ class _MambaUnifiedViewEdit(KVCacheGroupEdit):
                 f"cannot tile a {row}-element state row into {block_size} "
                 f"aligned tokens within the {page_bytes}-byte page"
             )
-        if kv_layout == "NHD":
-            inner = (block_size, 1, head_size)
-            inner_strides = (head_size, head_size, 1)
-        else:
+        if heads_first:
             inner = (1, block_size, head_size)
             inner_strides = (block_size * head_size, head_size, 1)
+        else:
+            inner = (block_size, 1, head_size)
+            inner_strides = (head_size, head_size, 1)
         return kv_cache.as_strided(
             (num_blocks, *inner), (kv_cache.stride(0), *inner_strides)
         )
@@ -549,6 +605,7 @@ class _SubpagedMLAAttentionViewEdit(KVCacheGroupEdit):
 
 # Rule registry, in match priority order.
 _EDITS: tuple[KVCacheGroupEdit, ...] = (
+    _UnifiedAttentionViewEdit(),
     _MambaUnifiedViewEdit(),
     _MambaPageViewEdit(),
     _SubpagedMLAAttentionViewEdit(),
@@ -584,14 +641,23 @@ def apply_kv_cache_group_edits(
     """
     # Backstop for connectors initialized without a kv_cache_config.
     validate_kv_cache_groups(kv_cache_config)
-    if kv_cache_config is None or not kv_cache_config.has_mamba_layers:
+    if kv_cache_config is None:
         return dict(kv_caches)
 
     edited = dict(kv_caches)
     counts: Counter[str] = Counter()
     for group in kv_cache_config.kv_cache_groups:
-        spec = group.kv_cache_spec
+        group_spec = group.kv_cache_spec
+        # ``UniformTypeKVCacheSpecs`` wraps per-layer leaf specs (e.g. vLLM's
+        # unified attention groups mix full-attention and compressed MLA
+        # owners); edits reason about the leaf that owns the layer.
+        leaf_specs = getattr(group_spec, "kv_cache_specs", None)
         for name in group.layer_names:
+            spec = (
+                leaf_specs.get(name, group_spec)
+                if isinstance(leaf_specs, dict)
+                else group_spec
+            )
             for edit in _EDITS:
                 if edit.matches(spec, kv_caches[name]):
                     edited[name] = edit.apply(spec, kv_caches[name], layout_hints)
