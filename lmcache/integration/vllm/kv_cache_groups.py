@@ -32,6 +32,24 @@ def _is_attention_spec(spec: Any) -> bool:
     return any(cls.__name__ == "AttentionSpec" for cls in type(spec).__mro__)
 
 
+def is_prefix_cacheable_spec(spec: Any) -> bool:
+    """Whether a group spec holds positional prefix KV.
+
+    vLLM's per-request scratch rings (``CircularBufferSpec``, ``KpoolTailSpec``)
+    declare ``prefix_cacheable = False`` (renamed to
+    ``participates_in_prefix_caching`` on newer engines; probe both). Their
+    bytes must never be stored or served as prefix cache.
+    """
+    return (
+        getattr(
+            spec,
+            "participates_in_prefix_caching",
+            getattr(spec, "prefix_cacheable", True),
+        )
+        is not False
+    )
+
+
 def get_tokens_per_block(kv_cache_spec: Any, dcp_size: int) -> int:
     """Global tokens covered by one block id of ``kv_cache_spec``.
 
@@ -327,11 +345,7 @@ def create_engine_group_infos_from_vllm(
             group_tokens_per_block[engine_group_id] = get_tokens_per_block(
                 group.kv_cache_spec, dcp_size
             )
-            # Groups whose spec is not prefix cacheable (e.g. vLLM's
-            # ``CircularBufferSpec``: one per-request ring buffer holding the
-            # current compression window) carry no positional KV; their bytes
-            # must never be stored or served as prefix cache.
-            if getattr(group.kv_cache_spec, "prefix_cacheable", True) is False:
+            if not is_prefix_cacheable_spec(group.kv_cache_spec):
                 logger.info(
                     "Excluding non-prefix-cacheable engine group %d (%s, %d layers)",
                     engine_group_id,

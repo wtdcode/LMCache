@@ -231,13 +231,18 @@ class LMCacheMPRequestMetadata:
         # gemma-4 sliding: one 32-token ID covers 2x the tokens of a
         # 16-token full-attention ID).
         allocated_lengths = tracker.num_allocated_blocks()
+        positional_groups = [
+            engine_group_idx
+            for engine_group_idx in range(num_engine_groups)
+            if group_tokens_per_block[engine_group_idx] > 0
+        ]
         allocated_tokens = (
             min(
                 allocated_lengths.get(engine_group_idx, 0)
                 * group_tokens_per_block[engine_group_idx]
-                for engine_group_idx in range(num_engine_groups)
+                for engine_group_idx in positional_groups
             )
-            if num_engine_groups > 0
+            if positional_groups
             else 0
         )
         min_available_tokens = min(

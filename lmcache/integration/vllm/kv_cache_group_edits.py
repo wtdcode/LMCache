@@ -50,6 +50,7 @@ from vllm.v1.kv_cache_interface import (
 import torch
 
 # First Party
+from lmcache.integration.vllm.kv_cache_groups import is_prefix_cacheable_spec
 from lmcache.logging import init_logger
 from lmcache.v1.gpu_connector.utils import LayoutHints
 
@@ -161,9 +162,7 @@ def validate_kv_cache_groups(kv_cache_config: KVCacheConfig | None) -> None:
             kind = get_kv_cache_spec_kind(spec)
             if kind == KVCacheSpecKind.CROSS_ATTENTION:
                 unsupported.append(f"group {group_idx}: CrossAttentionSpec")
-            elif kind == KVCacheSpecKind.UNKNOWN and getattr(
-                spec, "prefix_cacheable", True
-            ):
+            elif kind == KVCacheSpecKind.UNKNOWN and is_prefix_cacheable_spec(spec):
                 unsupported.append(
                     f"group {group_idx}: {type(spec).__name__} (unknown spec "
                     "kind that declares prefix-cacheable KV)"

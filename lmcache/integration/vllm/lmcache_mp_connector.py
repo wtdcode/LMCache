@@ -43,6 +43,7 @@ from lmcache.integration.vllm.kv_cache_group_edits import (
 from lmcache.integration.vllm.kv_cache_groups import (
     create_engine_group_infos_from_vllm,
     get_tokens_per_block,
+    is_prefix_cacheable_spec,
 )
 from lmcache.integration.vllm.lazy_offload_pending_store import (
     LazyOffloadPendingStore,
@@ -168,8 +169,11 @@ def get_group_tokens_per_block(
 
     Attention pages are local DCP shards and therefore cover
     ``spec.block_size * dcp_size`` global tokens. Recurrent-state pages are
-    replicated and retain their physical ``spec.block_size`` span. When vLLM
-    does not provide group metadata, preserve the legacy single-group rule.
+    replicated and retain their physical ``spec.block_size`` span. Groups
+    whose spec is not prefix cacheable (vLLM's per-request
+    ``CircularBufferSpec`` / ``KpoolTailSpec`` scratch rings) hold no
+    positional KV and are reported as ``0``. When vLLM does not provide
+    group metadata, preserve the legacy single-group rule.
 
     Args:
         vllm_config: The active vLLM configuration.
@@ -185,7 +189,10 @@ def get_group_tokens_per_block(
         else ()
     )
     return [
-        get_tokens_per_block(group.kv_cache_spec, dcp_size) for group in groups
+        get_tokens_per_block(group.kv_cache_spec, dcp_size)
+        if is_prefix_cacheable_spec(group.kv_cache_spec)
+        else 0
+        for group in groups
     ] or [vllm_config.cache_config.block_size * dcp_size]
 
 
@@ -205,7 +212,13 @@ def get_vllm_scheduler_block_size(
     Returns:
         The scheduler block size in tokens.
     """
-    group_spans = get_group_tokens_per_block(vllm_config, kv_cache_config)
+    group_spans = [
+        span
+        for span in get_group_tokens_per_block(vllm_config, kv_cache_config)
+        if span > 0
+    ]
+    if not group_spans:
+        raise ValueError("no prefix-cacheable KV cache group to serve")
     scheduler_block_size = math.lcm(*group_spans)
     largest_group_span = max(group_spans)
     if scheduler_block_size > largest_group_span * _MAX_LCM_EXPANSION_FACTOR:
@@ -645,18 +658,30 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
         # full-attention groups 16; DeepSeek V4: 256/64/8/4). Falls back to
         # the engine's base block size when no group metadata is available
         # (single non-hybrid group).
+        # A ``0`` marks a non-positional group (spec not prefix cacheable,
+        # e.g. vLLM's per-request ``CircularBufferSpec`` ring buffer): it is
+        # excluded from registration, block-id slicing and capacity math.
         self._group_tokens_per_block = group_tokens_per_block
+        positional_tokens_per_block = [
+            t for t in self._group_tokens_per_block if t != 0
+        ]
         for engine_group_idx, tokens_per_block in enumerate(
             self._group_tokens_per_block
         ):
-            if tokens_per_block <= 0:
+            if tokens_per_block < 0:
                 raise ValueError(
                     f"group {engine_group_idx} tokens_per_block "
                     f"{tokens_per_block} must be positive"
                 )
+        if not positional_tokens_per_block:
+            raise ValueError("no prefix-cacheable KV cache group to serve")
+        # Engine group used for flat (single-group) telemetry.
+        self._primary_group_idx = self._group_tokens_per_block.index(
+            positional_tokens_per_block[0]
+        )
         # Smallest token count aligned to every group's paged-chunk
         # boundary; used to round down vLLM APC hit counts.
-        self._hit_alignment_tokens = math.lcm(*self._group_tokens_per_block)
+        self._hit_alignment_tokens = math.lcm(*positional_tokens_per_block)
         if self.role == KVConnectorRole.SCHEDULER:
             # Chunk boundaries must land on every group's paged-chunk
             # boundary so per-group block-id slicing stays aligned.
@@ -664,7 +689,7 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
             for engine_group_idx, tokens_per_block in enumerate(
                 self._group_tokens_per_block
             ):
-                if lmcache_tokens_per_chunk % tokens_per_block != 0:
+                if tokens_per_block and lmcache_tokens_per_chunk % tokens_per_block:
                     raise ValueError(
                         f"LMCache chunk size {lmcache_tokens_per_chunk} must be "
                         f"a multiple of group {engine_group_idx} "
@@ -1535,9 +1560,13 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
             tracker = self.request_trackers.get(new_request.req_id)
             if tracker is None:
                 continue
-            primary_block_ids = tracker.allocated_block_ids.get(0, [])
+            primary_block_ids = tracker.allocated_block_ids.get(
+                self._primary_group_idx, []
+            )
             num_blocks = len(primary_block_ids)
-            total_tokens = num_blocks * self._group_tokens_per_block[0]
+            total_tokens = (
+                num_blocks * self._group_tokens_per_block[self._primary_group_idx]
+            )
             records.append(
                 RequestAllocationRecord(
                     req_id=new_request.req_id,
@@ -1554,7 +1583,11 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
         for idx, request_id in enumerate(cached_reqs.req_ids):
             # The L0 subscriber works on the primary (group 0) block-id list.
             new_group_block_ids = cached_reqs.new_block_ids[idx]
-            new_block_ids = new_group_block_ids[0] if new_group_block_ids else []
+            new_block_ids = (
+                new_group_block_ids[self._primary_group_idx]
+                if new_group_block_ids
+                else []
+            )
             if not new_block_ids:
                 continue
             tracker = self.request_trackers.get(request_id)
@@ -1562,9 +1595,11 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
                 continue
             # The new blocks sit at the end of the request's block list.
             # Compute the token range they cover.
-            total_blocks = len(tracker.allocated_block_ids.get(0, []))
+            total_blocks = len(
+                tracker.allocated_block_ids.get(self._primary_group_idx, [])
+            )
             num_new_blocks = len(new_block_ids)
-            tokens_per_block = self._group_tokens_per_block[0]
+            tokens_per_block = self._group_tokens_per_block[self._primary_group_idx]
             start_token = (total_blocks - num_new_blocks) * tokens_per_block
             end_token = total_blocks * tokens_per_block
             new_token_ids = tracker.get_token_ids()[start_token:end_token]
