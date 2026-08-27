@@ -327,6 +327,18 @@ def create_engine_group_infos_from_vllm(
             group_tokens_per_block[engine_group_id] = get_tokens_per_block(
                 group.kv_cache_spec, dcp_size
             )
+            # Groups whose spec is not prefix cacheable (e.g. vLLM's
+            # ``CircularBufferSpec``: one per-request ring buffer holding the
+            # current compression window) carry no positional KV; their bytes
+            # must never be stored or served as prefix cache.
+            if getattr(group.kv_cache_spec, "prefix_cacheable", True) is False:
+                logger.info(
+                    "Excluding non-prefix-cacheable engine group %d (%s, %d layers)",
+                    engine_group_id,
+                    type(group.kv_cache_spec).__name__,
+                    len(group.layer_names),
+                )
+                continue
             for name in group.layer_names:
                 per_layer_group_idx[layer_to_idx[name]] = engine_group_id
         per_layer_sw_size = _resolve_per_layer_sw_sizes(

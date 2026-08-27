@@ -83,7 +83,11 @@ def _declares_slot_compression(spec: KVCacheSpec) -> bool:
     groups belong to the compression path in ``lmcache.v1.kv_layer_groups``.
     """
     return (
-        getattr(spec, "compress_ratio", 1) > 1 or getattr(spec, "tq_slot_size", 0) > 0
+        getattr(spec, "compress_ratio", 1) > 1
+        # vLLM unified KV cache renamed the slot packing to ``tokens_per_state``
+        # (``num_states = block_size // tokens_per_state``).
+        or getattr(spec, "tokens_per_state", 1) > 1
+        or getattr(spec, "tq_slot_size", 0) > 0
     )
 
 
@@ -125,6 +129,13 @@ def validate_kv_cache_groups(kv_cache_config: KVCacheConfig | None) -> None:
             kind = get_kv_cache_spec_kind(spec)
             if kind == KVCacheSpecKind.CROSS_ATTENTION:
                 unsupported.append(f"group {group_idx}: CrossAttentionSpec")
+            elif kind == KVCacheSpecKind.UNKNOWN and getattr(
+                spec, "prefix_cacheable", True
+            ):
+                unsupported.append(
+                    f"group {group_idx}: {type(spec).__name__} (unknown spec "
+                    "kind that declares prefix-cacheable KV)"
+                )
             elif kind == KVCacheSpecKind.MAMBA and getattr(
                 spec, "mamba_cache_mode", "none"
             ) not in ("align", "all"):
