@@ -84,11 +84,18 @@ def _declares_slot_compression(spec: KVCacheSpec) -> bool:
     """
     return (
         getattr(spec, "compress_ratio", 1) > 1
-        # vLLM unified KV cache renamed the slot packing to ``tokens_per_state``
-        # (``num_states = block_size // tokens_per_state``).
-        or getattr(spec, "tokens_per_state", 1) > 1
+        or _tokens_per_state(spec) > 1
         or getattr(spec, "tq_slot_size", 0) > 0
     )
+
+
+def _tokens_per_state(spec: KVCacheSpec) -> int:
+    """vLLM unified KV cache slot packing (``num_states = block_size //
+    tokens_per_state``); the base property raises for specs without it."""
+    try:
+        return int(getattr(spec, "tokens_per_state", 1))
+    except NotImplementedError:
+        return 1
 
 
 def _leaf_specs(spec: KVCacheSpec) -> list[KVCacheSpec]:
