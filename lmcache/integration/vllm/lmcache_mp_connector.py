@@ -459,20 +459,35 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
         # full-attention groups 16; DeepSeek V4: 256/64/8/4). Falls back to
         # the engine's base block size when no group metadata is available
         # (single non-hybrid group).
+        # A ``0`` marks a non-positional group (spec not prefix cacheable,
+        # e.g. vLLM's per-request ``CircularBufferSpec`` ring buffer): it is
+        # excluded from registration, block-id slicing and capacity math.
         self._group_tokens_per_block: list[int] = [
-            get_tokens_per_block(group.kv_cache_spec, dcp_size) for group in vllm_groups
+            0
+            if getattr(group.kv_cache_spec, "prefix_cacheable", True) is False
+            else get_tokens_per_block(group.kv_cache_spec, dcp_size)
+            for group in vllm_groups
         ] or [vllm_config.cache_config.block_size * dcp_size]
+        positional_tokens_per_block = [
+            t for t in self._group_tokens_per_block if t != 0
+        ]
         for engine_group_idx, tokens_per_block in enumerate(
             self._group_tokens_per_block
         ):
-            if tokens_per_block <= 0:
+            if tokens_per_block < 0:
                 raise ValueError(
                     f"group {engine_group_idx} tokens_per_block "
                     f"{tokens_per_block} must be positive"
                 )
+        if not positional_tokens_per_block:
+            raise ValueError("no prefix-cacheable KV cache group to serve")
+        # Engine group used for flat (single-group) telemetry.
+        self._primary_group_idx = self._group_tokens_per_block.index(
+            positional_tokens_per_block[0]
+        )
         # Smallest token count aligned to every group's paged-chunk
         # boundary; used to round down vLLM APC hit counts.
-        self._hit_alignment_tokens = math.lcm(*self._group_tokens_per_block)
+        self._hit_alignment_tokens = math.lcm(*positional_tokens_per_block)
         if self.role == KVConnectorRole.SCHEDULER:
             # Chunk boundaries must land on every group's paged-chunk
             # boundary so per-group block-id slicing stays aligned.
@@ -480,7 +495,7 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
             for engine_group_idx, tokens_per_block in enumerate(
                 self._group_tokens_per_block
             ):
-                if lmcache_tokens_per_chunk % tokens_per_block != 0:
+                if tokens_per_block and lmcache_tokens_per_chunk % tokens_per_block:
                     raise ValueError(
                         f"LMCache chunk size {lmcache_tokens_per_chunk} must be "
                         f"a multiple of group {engine_group_idx} "
@@ -1325,9 +1340,13 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
             tracker = self.request_trackers.get(new_request.req_id)
             if tracker is None:
                 continue
-            primary_block_ids = tracker.allocated_block_ids.get(0, [])
+            primary_block_ids = tracker.allocated_block_ids.get(
+                self._primary_group_idx, []
+            )
             num_blocks = len(primary_block_ids)
-            total_tokens = num_blocks * self._group_tokens_per_block[0]
+            total_tokens = (
+                num_blocks * self._group_tokens_per_block[self._primary_group_idx]
+            )
             records.append(
                 RequestAllocationRecord(
                     req_id=new_request.req_id,
@@ -1344,7 +1363,11 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
         for idx, request_id in enumerate(cached_reqs.req_ids):
             # The L0 subscriber works on the primary (group 0) block-id list.
             new_group_block_ids = cached_reqs.new_block_ids[idx]
-            new_block_ids = new_group_block_ids[0] if new_group_block_ids else []
+            new_block_ids = (
+                new_group_block_ids[self._primary_group_idx]
+                if new_group_block_ids
+                else []
+            )
             if not new_block_ids:
                 continue
             tracker = self.request_trackers.get(request_id)
@@ -1352,9 +1375,11 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
                 continue
             # The new blocks sit at the end of the request's block list.
             # Compute the token range they cover.
-            total_blocks = len(tracker.allocated_block_ids.get(0, []))
+            total_blocks = len(
+                tracker.allocated_block_ids.get(self._primary_group_idx, [])
+            )
             num_new_blocks = len(new_block_ids)
-            tokens_per_block = self._group_tokens_per_block[0]
+            tokens_per_block = self._group_tokens_per_block[self._primary_group_idx]
             start_token = (total_blocks - num_new_blocks) * tokens_per_block
             end_token = total_blocks * tokens_per_block
             new_token_ids = tracker.get_token_ids()[start_token:end_token]
