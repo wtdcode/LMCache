@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # Standard
-from typing import TYPE_CHECKING, Literal, Optional, Tuple
+from typing import Any, TYPE_CHECKING, Literal, Optional, Tuple
 import hashlib
 import os
 import string
@@ -36,20 +36,59 @@ def is_false(value: str) -> bool:
     return value.lower() in ("false", "0", "no", "n", "off")
 
 
-def vllm_layout_hints() -> "LayoutHints":
-    """Build layout_hints dict by querying vLLM at runtime."""
+def vllm_layout_hints(vllm_config: Any = None) -> "LayoutHints":
+    """Build layout_hints dict by querying vLLM at runtime.
+
+    ``vllm_config`` is consulted for vLLM builds that resolve the physical
+    layout as a ``KVCacheLayout`` enum on ``CacheConfig`` instead of exposing
+    the legacy ``get_kv_cache_layout()`` helper.
+    """
     hints: dict[str, str] = {}
-    kv_layout = try_get_vllm_kv_cache_layout()
+    kv_layout = try_get_vllm_kv_cache_layout(vllm_config)
     if kv_layout is not None:
         hints["kv_layout"] = kv_layout
     return hints  # type: ignore[return-value]
 
 
-def try_get_vllm_kv_cache_layout() -> Literal["NHD", "HND"] | None:
+def _kv_layout_from_enum(layout: Any) -> Literal["NHD", "HND"] | None:
+    """Map a vLLM ``KVCacheLayout`` member to the legacy NHD/HND names.
+
+    vLLM's unified KV cache (RFC #42082) describes every group as a logical
+    ``[L, B, H, N, C]`` tensor plus a stride permutation. Per layer the view
+    is ``[B, N, H, C]`` (NHD) or ``[B, H, N, C]`` (HND); layouts that
+    interleave layers inside a block (block-outermost packing) keep that
+    per-layer axis order and only inflate the dim-0 (block) stride, which the
+    transfer kernels honour through ``block_stride_elems``.
+    """
+    order = getattr(layout, "layer_view_order", None)
+    if order is None:
+        return None
+    order = tuple(order)
+    # Logical per-layer axes: 0=B, 1=H, 2=N, 3=C.
+    if order == (0, 2, 1, 3):
+        return "NHD"
+    if order == (0, 1, 2, 3):
+        return "HND"
+    logger.error(
+        "Unsupported vLLM KV cache layout %s (per-layer axis order %s): the "
+        "block axis must be outermost within a layer view",
+        getattr(layout, "name", layout),
+        order,
+    )
+    return None
+
+
+def try_get_vllm_kv_cache_layout(
+    vllm_config: Any = None,
+) -> Literal["NHD", "HND"] | None:
     """Try to query the KV cache layout from vLLM at runtime.
 
     Returns ``"NHD"`` or ``"HND"`` if vLLM is available and the layout
     has been configured, otherwise ``None``.
+
+    Newer vLLM builds drop ``get_kv_cache_layout()`` and instead resolve a
+    ``KVCacheLayout`` enum once on ``CacheConfig``; pass ``vllm_config`` so
+    that path can be used.
 
     Please only call this where vllm is available (i.e. not in the MP server)
     We will print an error if we try to get vllm kv layout where vllm
@@ -65,11 +104,22 @@ def try_get_vllm_kv_cache_layout() -> Literal["NHD", "HND"] | None:
 
         return get_kv_cache_layout()
     except Exception:
-        logger.error(
-            "vLLM is not available but tried to query kv cache "
-            "layout information, cannot get KV cache layout"
-        )
-        return None
+        pass
+
+    cache_config = getattr(vllm_config, "cache_config", None)
+    resolver = getattr(cache_config, "get_resolved_kv_cache_layout", None)
+    if resolver is not None:
+        try:
+            return _kv_layout_from_enum(resolver())
+        except Exception as exc:
+            logger.error("Failed to resolve vLLM KV cache layout: %s", exc)
+            return None
+
+    logger.error(
+        "vLLM is not available but tried to query kv cache "
+        "layout information, cannot get KV cache layout"
+    )
+    return None
 
 
 def lmcache_get_or_create_config() -> LMCacheEngineConfig:

@@ -19,6 +19,7 @@ from lmcache import torch_dev
 from lmcache.integration.request_telemetry.factory import RequestTelemetryFactory
 from lmcache.integration.vllm.experimental import dispatch
 from lmcache.integration.vllm.utils import vllm_layout_hints
+from lmcache.v1.gpu_connector.kv_format.types import LayoutHints
 from lmcache.utils import EngineType, _lmcache_nvtx_annotate, init_logger
 from lmcache.v1.multiprocess.custom_types import (
     BlockAllocationRecord,
@@ -1277,6 +1278,7 @@ class LMCacheMPWorkerAdapter:
         self,
         kv_caches: dict[str, torch.Tensor],
         engine_group_infos: Sequence[EngineGroupInfo] = (),
+        layout_hints: "LayoutHints | None" = None,
     ) -> None:
         """
         Register the kv caches with LMCache server.
@@ -1285,6 +1287,8 @@ class LMCacheMPWorkerAdapter:
             kv_caches: A dict of kv caches to register. The keys are the
                 layer names and the values are the corresponding tensors.
             engine_group_infos: LMCache-owned engine KV cache group metadata.
+            layout_hints: Engine layout hints resolved by the connector (which
+                has the vLLM config); ``None`` queries vLLM directly.
 
         Raises:
             ConnectionError: if the server does not respond within
@@ -1294,6 +1298,7 @@ class LMCacheMPWorkerAdapter:
                 not align with that group's paged-chunk boundaries).
         """
         logger.info("Registering kv caches")
+        self._layout_hints = layout_hints
         for info in engine_group_infos:
             if (
                 info.tokens_per_block > 0
@@ -1329,7 +1334,9 @@ class LMCacheMPWorkerAdapter:
         """
         self.kv_caches = kv_caches
         transfer_ctx = create_transfer_context(kv_caches, mode=self._mp_transfer_mode)
-        layout_hints = vllm_layout_hints()
+        layout_hints = getattr(self, "_layout_hints", None)
+        if layout_hints is None:
+            layout_hints = vllm_layout_hints()
         self.transfer_ctx = transfer_ctx
         try:
             # Register on the local, not self.transfer_ctx: a concurrent

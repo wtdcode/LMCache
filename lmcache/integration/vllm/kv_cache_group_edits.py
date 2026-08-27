@@ -83,7 +83,11 @@ def _declares_slot_compression(spec: KVCacheSpec) -> bool:
     groups belong to the compression path in ``lmcache.v1.kv_layer_groups``.
     """
     return (
-        getattr(spec, "compress_ratio", 1) > 1 or getattr(spec, "tq_slot_size", 0) > 0
+        getattr(spec, "compress_ratio", 1) > 1
+        # vLLM unified KV cache renamed the slot packing to ``tokens_per_state``
+        # (``num_states = block_size // tokens_per_state``).
+        or getattr(spec, "tokens_per_state", 1) > 1
+        or getattr(spec, "tq_slot_size", 0) > 0
     )
 
 
@@ -125,6 +129,13 @@ def validate_kv_cache_groups(kv_cache_config: KVCacheConfig | None) -> None:
             kind = get_kv_cache_spec_kind(spec)
             if kind == KVCacheSpecKind.CROSS_ATTENTION:
                 unsupported.append(f"group {group_idx}: CrossAttentionSpec")
+            elif kind == KVCacheSpecKind.UNKNOWN and getattr(
+                spec, "prefix_cacheable", True
+            ):
+                unsupported.append(
+                    f"group {group_idx}: {type(spec).__name__} (unknown spec "
+                    "kind that declares prefix-cacheable KV)"
+                )
             elif kind == KVCacheSpecKind.MAMBA and getattr(
                 spec, "mamba_cache_mode", "none"
             ) not in ("align", "all"):
@@ -414,6 +425,20 @@ class _MambaUnifiedViewEdit(KVCacheGroupEdit):
             "single-layer KV cache must be a torch.Tensor"
         )
         kv_layout = layout_hints.get("kv_layout", "none")
+        # A block-outermost pool (vLLM unified layout with layers packed inside
+        # each block) leaves dim-0 padded; ``view`` cannot re-split a padded
+        # dim-0 so keep the page as one opaque slot per block in that case.
+        # The compression path then derives ``tokens_per_block // 1`` for it.
+        page_elems = kv_cache.shape[1] * kv_cache.shape[2] * kv_cache.shape[3]
+        if int(kv_cache.stride(0)) != page_elems or page_elems % spec.block_size:
+            logger.info(
+                "mamba-unified-view: keeping padded/indivisible page as one "
+                "slot per block (stride0=%d, page_elems=%d, block_size=%d)",
+                int(kv_cache.stride(0)),
+                page_elems,
+                spec.block_size,
+            )
+            return kv_cache.view(kv_cache.shape[0], 1, 1, -1)
         if kv_layout == "NHD":
             return kv_cache.view(kv_cache.shape[0], spec.block_size, 1, -1)
         elif kv_layout == "HND":

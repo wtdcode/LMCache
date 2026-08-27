@@ -495,6 +495,12 @@ _BLOCK_AXIS_FORMATS: frozenset = frozenset(
     {
         lmcache_native.EngineKVFormat.NL_X_NB_BS_HS,
         lmcache_native.EngineKVFormat.NL_X_NB_BSV_BSS,
+        # vLLM unified KV cache (RFC #42082): per-layer [NB, BS, NH, CS] /
+        # [NB, NH, BS, CS] views whose dim-0 is the block axis. Block-outermost
+        # packings (e.g. BLNHC) interleave every layer's page inside one
+        # block, so stride(0) is the whole block, not the tight page.
+        lmcache_native.EngineKVFormat.NL_X_NB_BS_NH_CS,
+        lmcache_native.EngineKVFormat.NL_X_NB_NH_BS_CS,
     }
 )
 
@@ -574,8 +580,8 @@ def resolve_block_stride_and_log_layout(
                     "resolve_block_stride_and_log_layout: group's probe "
                     f"tensor has dim-0 padding ({padding} elements per "
                     f"block) but engine_kv_format={engine_kv_format!r} is not "
-                    "a supported dim-0-padded format (only "
-                    "NL_X_NB_BS_HS is); downstream transfer kernels "
+                    "a supported dim-0-padded format (only the block-axis "
+                    "formats are); downstream transfer kernels "
                     "cannot honour this padding and would read/write "
                     "wrong bytes. "
                     f"layer_idx={layer_idx}, shape={tuple(rep.shape)}, "
