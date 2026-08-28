@@ -331,7 +331,14 @@ def create_engine_group_infos_from_vllm(
             # ``CircularBufferSpec``: one per-request ring buffer holding the
             # current compression window) carry no positional KV; their bytes
             # must never be stored or served as prefix cache.
-            if getattr(group.kv_cache_spec, "prefix_cacheable", True) is False:
+            # vLLM renamed this to ``participates_in_prefix_caching``; probe the
+            # new name first and fall back to the old one for older engines.
+            spec_prefix_cacheable = getattr(
+                group.kv_cache_spec,
+                "participates_in_prefix_caching",
+                getattr(group.kv_cache_spec, "prefix_cacheable", True),
+            )
+            if spec_prefix_cacheable is False:
                 logger.info(
                     "Excluding non-prefix-cacheable engine group %d (%s, %d layers)",
                     engine_group_id,
