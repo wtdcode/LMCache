@@ -258,6 +258,12 @@ Caveats
   backends do not support vLLM's batch-invariant mode. Validate with a
   **score-level** comparison (see `Verifying Correctness`_), not a token-level
   diff.
+- **Speculative decoding (MTP) requires** ``--max-num-batched-tokens N``
+  (exactly the unified block size). With MTP enabled and a larger step, the
+  recurrent-state chunks stored from multi-block prefill steps corrupt later
+  prefix hits (verified on Qwen3.8-Flash-Next FP8: certain hit depths resume
+  from a wrong recurrent state and generate garbage; ``N`` is correct for the
+  same prompts). The connector now rejects this combination at startup.
 - The cached pages are **byte-opaque**, so content-aware features (CacheGen
   compression, CacheBlend) do not apply, and cache entries must not be shared
   across engines with different attention backends or kernel block sizes.
