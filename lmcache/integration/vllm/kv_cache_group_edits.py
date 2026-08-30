@@ -568,7 +568,69 @@ class _SubpagedMLAAttentionViewEdit(KVCacheGroupEdit):
 
 
 # Rule registry, in match priority order.
+class _SubpagedUnifiedMLAViewEdit(KVCacheGroupEdit):
+    """Re-view a kernel-paged 4-dim MLA/indexer pool at logical-block pages.
+
+    GLM-5.3-Flash registers its MLA latent pool as ``[NB*10, 1, 64, 512]``
+    (64-token kernel pages) and its kpool indexer as ``[NB*5, 1, 32, 132]``
+    (32-slot kernel pages), while the scheduler's block ids address 640-token
+    logical blocks. Without this edit ``_UnifiedAttentionViewEdit`` matches
+    first and keeps kernel-page granularity, so the transfer path indexes the
+    page array with logical-block ids -- reading and writing 10x (MLA) / 5x
+    (indexer) off, which corrupts every stored chunk of these groups
+    (recurrent-state groups were unaffected; that is why hits produced
+    garbage while KDA state round-tripped exactly).
+
+    Matches only when the slot count per logical block
+    (``block_size // tokens_per_state``) is a whole multiple of the kernel
+    page's slot dim and the pool is tight (page stride == page numel), so a
+    plain ``view`` regroups ``factor`` contiguous kernel pages into one
+    logical page. Layouts already at logical granularity (Qwen, DSV4) do not
+    match.
+    """
+
+    name = "subpaged-unified-mla-view"
+
+    def matches(self, spec: KVCacheSpec, kv_cache: RegisteredKVCache) -> bool:
+        if (
+            get_kv_cache_spec_kind(spec) == KVCacheSpecKind.MAMBA
+            or not isinstance(kv_cache, torch.Tensor)
+            or kv_cache.ndim != 4
+            or kv_cache.shape[1] != 1
+            or getattr(spec, "compress_ratio", 1) > 1
+            or getattr(spec, "tq_slot_size", 0) > 0
+        ):
+            return False
+        block_size = getattr(spec, "block_size", 0)
+        if not block_size:
+            return False
+        expected_slots = block_size // _tokens_per_state(spec)
+        page_slots = kv_cache.shape[2]
+        return (
+            expected_slots > page_slots
+            and page_slots > 0
+            and expected_slots % page_slots == 0
+            and kv_cache.shape[0] % (expected_slots // page_slots) == 0
+            and int(kv_cache.stride(0))
+            == kv_cache.shape[1] * kv_cache.shape[2] * kv_cache.shape[3]
+        )
+
+    def apply(
+        self,
+        spec: KVCacheSpec,
+        kv_cache: RegisteredKVCache,
+        _layout_hints: LayoutHints,
+    ) -> torch.Tensor:
+        assert isinstance(kv_cache, torch.Tensor)
+        expected_slots = spec.block_size // _tokens_per_state(spec)
+        factor = expected_slots // kv_cache.shape[2]
+        return kv_cache.view(
+            kv_cache.shape[0] // factor, 1, expected_slots, kv_cache.shape[3]
+        )
+
+
 _EDITS: tuple[KVCacheGroupEdit, ...] = (
+    _SubpagedUnifiedMLAViewEdit(),
     _UnifiedAttentionViewEdit(),
     _MambaUnifiedViewEdit(),
     _MambaPageViewEdit(),
