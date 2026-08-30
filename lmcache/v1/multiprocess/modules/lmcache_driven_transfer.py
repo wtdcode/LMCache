@@ -866,15 +866,24 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
             their handler callables and thread pool assignments.
         """
         return [
+            # AFFINITY, not SYNC: registration of a large engine (e.g.
+            # DeepSeek-V4 1M-context, 88 layers per worker) can take minutes,
+            # and a SYNC handler runs inline in the mq main loop -- while one
+            # worker registers, the server answers nothing, so the remaining
+            # workers' connect pings starve into "Cannot reach the LMCache MP
+            # server" and the engine dies. The affinity pool keys on the zmq
+            # client identity, so each client's own requests stay ordered
+            # (register before store/retrieve) while different workers
+            # register concurrently and pings keep being served.
             HandlerSpec(
                 RequestType.REGISTER_KV_CACHE,
                 self.register_kv_cache,
-                ThreadPoolType.SYNC,
+                ThreadPoolType.AFFINITY,
             ),
             HandlerSpec(
                 RequestType.UNREGISTER_KV_CACHE,
                 self.unregister_kv_cache,
-                ThreadPoolType.SYNC,
+                ThreadPoolType.AFFINITY,
             ),
             HandlerSpec(
                 RequestType.STORE,
