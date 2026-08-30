@@ -351,6 +351,26 @@ def validate_mamba_step_alignment(
             f"max_num_batched_tokens={max_batched}, block_size={block_size}. "
             f"Set --max-num-batched-tokens to at least {block_size}."
         )
+    # Speculative decoding (MTP) breaks the store path when a prefill step can
+    # advance more than one block: chunks stored from such steps deterministically
+    # corrupt later prefix hits (verified on Qwen3.8-Flash-Next FP8: with
+    # max_num_batched_tokens in (block_size, 2*block_size], hits of certain
+    # depths resume from a wrong recurrent state and generate garbage, while
+    # max_num_batched_tokens == block_size is correct for the same prompts).
+    # Fail closed until the snapshot/store interaction is fixed.
+    if (
+        getattr(vllm_config, "speculative_config", None) is not None
+        and max_batched > block_size
+    ):
+        raise ValueError(
+            f"Mamba-hybrid models with LMCache and speculative decoding "
+            f"require max_num_batched_tokens == block_size ({block_size}); "
+            f"got {max_batched}. Larger values let a prefill step advance "
+            f"more than one block, and the recurrent-state chunks stored "
+            f"from such steps corrupt later prefix-cache hits. "
+            f"Set --max-num-batched-tokens {block_size}, or disable "
+            f"speculative decoding to use a larger step."
+        )
 
 
 def validate_dcp_support(
