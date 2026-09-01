@@ -85,7 +85,7 @@ def get_protocol_definitions() -> dict[str, ProtocolDefinition]:
                 list[EngineGroupInfo],
             ],
             response_class=None,
-            handler_type=HandlerType.SYNC,
+            handler_type=HandlerType.BLOCKING,
         ),
         # Unregister KV Cache
         # Payload:
@@ -94,7 +94,7 @@ def get_protocol_definitions() -> dict[str, ProtocolDefinition]:
         "UNREGISTER_KV_CACHE": ProtocolDefinition(
             payload_classes=[int],
             response_class=None,
-            handler_type=HandlerType.SYNC,
+            handler_type=HandlerType.BLOCKING,
         ),
         # Register QRingBuffer.
         # Same as REGISTER_KV_CACHE: the Q ring reuses worker's instance_id
