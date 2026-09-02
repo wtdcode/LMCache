@@ -1346,9 +1346,40 @@ class PrefetchController(StorageControllerInterface):
             else:
                 # write-locked -> read-locked; num_kv_readers so each TP
                 # worker gets its own read lock.
-                l1_mgr.finish_write_and_reserve_read(
+                lock_results = l1_mgr.finish_write_and_reserve_read(
                     loaded_keys, read_locks=request.num_kv_readers
                 )
+                # A loaded key can still fail to acquire its read lock (its
+                # buffer was evicted or force-deleted between the L2 write and
+                # this atomic transition). Such keys are NOT read-locked, so
+                # they must be dropped from the hit set: leaving their bits set
+                # would advertise them to the retriever, whose unsafe_read then
+                # finds them gone ("Failed to read prefetched object ...
+                # KEY_NOT_EXIST") and fails the whole retrieve. Clearing the
+                # bits demotes them to a normal miss (recomputed locally).
+                unlocked_keys = [
+                    k
+                    for k in loaded_keys
+                    if lock_results.get(k, (None, None))[0] is not L1Error.SUCCESS
+                ]
+                if unlocked_keys:
+                    logger.warning(
+                        "Prefetch: %d/%d loaded keys failed read-lock "
+                        "acquisition (evicted mid-transition); dropping them "
+                        "from the hit set.",
+                        len(unlocked_keys),
+                        len(loaded_keys),
+                    )
+                    unlocked_set = set(unlocked_keys)
+                    # Bitmap has no single-bit clear; rebuild it from the bits
+                    # to keep (set positions whose key is still locked).
+                    kept = Bitmap(num_keys)
+                    for gi, key in enumerate(request.keys):
+                        if result_bitmap.test(gi) and key not in unlocked_set:
+                            kept.set(gi)
+                    result_bitmap = kept
+                    loaded_keys = [k for k in loaded_keys if k not in unlocked_set]
+                    loaded_set = set(loaded_keys)
 
         # Clean up failed keys
         if failed_keys:
